@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# Unit tests for scripts/sync-metrics-to-loki.sh, with curl mocked so the
+# push body is captured rather than sent.
+
+set -u
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$REPO/scripts/sync-metrics-to-loki.sh"
+SAFE_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+pass=0
+fail=0
+assert_eq() { if [[ "$1" == "$2" ]]; then echo "  PASS  $3"; pass=$((pass+1)); else echo "  FAIL  $3 (expected '$1', got '$2')"; fail=$((fail+1)); fi; }
+assert_contains() { case "$2" in *"$1"*) echo "  PASS  $3"; pass=$((pass+1));; *) echo "  FAIL  $3 (missing '$1')"; fail=$((fail+1));; esac; }
+
+# Mock curl: captures the push body to $BODY and responds 204. The caller
+# streams the body as `--data-binary @-`, so `@-` reads stdin here too.
+make_mock_curl() {
+  local dir="$1" body="$2"
+  cat > "$dir/curl" <<EOF
+#!/usr/bin/env bash
+prev=""
+for a in "\$@"; do
+  if [[ "\$prev" == "--data-binary" ]]; then
+    if [[ "\$a" == "@-" ]]; then cat > "$body"; else printf '%s' "\$a" > "$body"; fi
+  fi
+  prev="\$a"
+done
+# emulate -w '%{http_code}' -o FILE: write nothing to the -o file, echo code
+echo -n "204"
+exit 0
+EOF
+  chmod +x "$dir/curl"
+}
+
+# As make_mock_curl, but appends each invocation's argv to $3 (the success
+# path calls curl twice: push, then flush).
+make_mock_curl_argv() {
+  local dir="$1" body="$2" argv_file="$3"
+  cat > "$dir/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${argv_file}"
+prev=""
+for a in "\$@"; do
+  if [[ "\$prev" == "--data-binary" ]]; then
+    if [[ "\$a" == "@-" ]]; then cat > "$body"; else printf '%s' "\$a" > "$body"; fi
+  fi
+  prev="\$a"
+done
+echo -n "204"
+exit 0
+EOF
+  chmod +x "$dir/curl"
+}
+
+tmp=$(mktemp -d)
+body="$tmp/body.json"
+make_mock_curl "$tmp" "$body"
+met="$tmp/m.jsonl"
+state="$tmp/state"
+
+# Fixture: a delegate row (with recipe+tier), a feedback row whose ref_ts points
+# at it, two delegate rows sharing the SAME second (duplicate-ts disambiguation),
+# and a bare-tier delegate row (no recipe).
+cat > "$met" <<'EOF'
+{"ts":"2026-05-10T10:00:00Z","source":"delegate","tier":"prose","recipe":"commit-message","estimated_tokens_avoided":42,"exit_status":0,"project":"repo-x"}
+{"ts":"2026-05-10T10:00:05Z","source":"delegate","tier":"code","estimated_tokens_avoided":7,"exit_status":0,"project":"repo-x"}
+{"ts":"2026-05-10T10:00:05Z","source":"delegate","tier":"code","estimated_tokens_avoided":9,"exit_status":2,"project":"repo-y"}
+{"ts":"2026-05-10T10:05:00Z","source":"feedback","ref_ts":"2026-05-10T10:00:00Z","kept":true,"project":"repo-x"}
+EOF
+
+# --- T1: dry-run makes no push, reports counts -----------------------------
+out=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --dry-run --metrics-file "$met" --state-file "$state" --loki-url http://x 2>&1)
+assert_contains "DRY RUN" "$out" "T1: dry-run announced"
+assert_contains '"source":"delegate","count":3' "$out" "T1: 3 delegate rows grouped"
+assert_contains '"source":"feedback","count":1' "$out" "T1: 1 feedback row grouped"
+[[ -f "$body" ]] && { echo "  FAIL  T1: dry-run must not push a body"; fail=$((fail+1)); } || { echo "  PASS  T1: dry-run pushed nothing"; pass=$((pass+1)); }
+
+# --- T2: real push captures a well-formed payload --------------------------
+rm -f "$state" "$body"
+EC=0
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met" --state-file "$state" --loki-url http://x >/dev/null 2>&1 || EC=$?
+assert_eq "0" "$EC" "T2: push run exits 0"
+if [[ -f "$body" ]] && jq empty "$body" >/dev/null 2>&1; then
+  echo "  PASS  T2: push body is valid JSON"; pass=$((pass+1))
+else
+  echo "  FAIL  T2: push body missing or invalid"; fail=$((fail+1))
+fi
+# Stream labels: service + source, two source streams.
+src_streams=$(jq -r '[.streams[].stream.source] | sort | join(",")' "$body")
+assert_eq "delegate,feedback" "$src_streams" "T2: one stream per source"
+svc=$(jq -r '[.streams[].stream.service] | unique | join(",")' "$body")
+assert_eq "delegate-local" "$svc" "T2: service label is delegate-local"
+
+# --- T3: ns timestamps are 19-digit and unique (duplicate-second rows) ------
+ns_lens=$(jq -r '[.streams[].values[][0] | length] | unique | join(",")' "$body")
+assert_eq "19" "$ns_lens" "T3: every ns timestamp is 19 digits"
+ns_total=$(jq -r '[.streams[].values[][0]] | length' "$body")
+ns_unique=$(jq -r '[.streams[].values[][0]] | unique | length' "$body")
+assert_eq "$ns_total" "$ns_unique" "T3: all ns timestamps unique (same-second rows disambiguated)"
+
+# --- T4: feedback row enriched with parent recipe + tier --------------------
+fb_line=$(jq -r '.streams[] | select(.stream.source=="feedback") | .values[0][1]' "$body")
+fb_recipe=$(printf '%s' "$fb_line" | jq -r '.recipe // ""')
+fb_tier=$(printf '%s' "$fb_line" | jq -r '.tier // ""')
+assert_eq "commit-message" "$fb_recipe" "T4: feedback enriched with parent recipe"
+assert_eq "prose" "$fb_tier" "T4: feedback enriched with parent tier"
+assert_eq "42" "$(printf '%s' "$fb_line" | jq -r '.estimated_tokens_avoided // ""')" \
+  "T4: feedback enriched with parent tokens (the tokens-by-verdict split)"
+
+# --- T4b: ref_id picks the right parent when two share a second --------------
+# The ts-keyed map handed a same-second sibling's recipe to a pinned verdict;
+# ref_id is the key two delegations cannot share.
+met4="$tmp/m4.jsonl"; state4="$tmp/state4"; body4="$tmp/body4.json"
+make_mock_curl "$tmp" "$body4"
+cat > "$met4" <<'EOF'
+{"ts":"2026-05-10T11:00:00Z","source":"delegate","tier":"prose","recipe":"commit-message","otel_span_id":"aaaa","estimated_tokens_avoided":10,"exit_status":0}
+{"ts":"2026-05-10T11:00:00Z","source":"delegate","tier":"prose","recipe":"pr-description","otel_span_id":"bbbb","estimated_tokens_avoided":20,"exit_status":0}
+{"ts":"2026-05-10T11:01:00Z","source":"feedback","ref_ts":"2026-05-10T11:00:00Z","ref_id":"aaaa","kept":false,"scaffold":true}
+EOF
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met4" --state-file "$state4" --loki-url http://x >/dev/null 2>&1
+fb4=$(jq -r '.streams[] | select(.stream.source=="feedback") | .values[0][1]' "$body4")
+assert_eq "commit-message" "$(printf '%s' "$fb4" | jq -r '.recipe // ""')" \
+  "T4b: a ref_id-pinned verdict takes its own parent's recipe, not a same-second sibling's"
+assert_eq "10" "$(printf '%s' "$fb4" | jq -r '.estimated_tokens_avoided // ""')" \
+  "T4b: and its own parent's tokens"
+
+# --- T4c: a repeat verdict takes the recipe but not the tokens again ---------
+# Summing tokens per feedback row would count a re-recorded delegation twice;
+# only its first verdict row carries them, including when the repeat arrives
+# in a later incremental run.
+printf '%s\n' '{"ts":"2026-05-10T11:02:00Z","source":"feedback","ref_ts":"2026-05-10T11:00:00Z","ref_id":"aaaa","kept":false,"scaffold":true,"final_file":"x.final.txt"}' >> "$met4"
+rm -f "$body4"
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --metrics-file "$met4" --state-file "$state4" --loki-url http://x >/dev/null 2>&1
+fb4b=$(jq -r '.streams[] | select(.stream.source=="feedback") | .values[0][1]' "$body4")
+assert_eq "commit-message" "$(printf '%s' "$fb4b" | jq -r '.recipe // ""')" \
+  "T4c: a repeat verdict pushed later still takes its parent's recipe"
+assert_eq "" "$(printf '%s' "$fb4b" | jq -r '.estimated_tokens_avoided // ""')" \
+  "T4c: but not the tokens, which its first verdict already carries"
+
+# --- T4d: a ts-only verdict and a later id-pinned one are the same delegation -
+# Keyed apart ("ts:" vs "id:"), both took the tokens; resolving the ts form to
+# the parent's span makes the id-pinned repeat a repeat.
+met5="$tmp/m5.jsonl"; state5="$tmp/state5"; body5="$tmp/body5.json"
+make_mock_curl "$tmp" "$body5"
+cat > "$met5" <<'EOF'
+{"ts":"2026-05-10T12:00:00Z","source":"delegate","tier":"prose","recipe":"commit-message","otel_span_id":"cccc","estimated_tokens_avoided":30,"exit_status":0}
+{"ts":"2026-05-10T12:01:00Z","source":"feedback","ref_ts":"2026-05-10T12:00:00Z","kept":true}
+{"ts":"2026-05-10T12:02:00Z","source":"feedback","ref_ts":"2026-05-10T12:00:00Z","ref_id":"cccc","kept":false,"scaffold":true}
+EOF
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met5" --state-file "$state5" --loki-url http://x >/dev/null 2>&1
+toks5=$(jq -r '[.streams[] | select(.stream.source=="feedback") | .values[][1] | fromjson | .estimated_tokens_avoided // empty] | join(",")' "$body5")
+assert_eq "30" "$toks5" "T4d: a ts-only verdict and an id-pinned repeat carry the tokens once between them"
+
+# --- T5: watermark idempotency ---------------------------------------------
+assert_eq "4" "$(cat "$state")" "T5: watermark set to row count"
+out=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --metrics-file "$met" --state-file "$state" --loki-url http://x 2>&1)
+assert_contains "nothing new to push" "$out" "T5: second run is a no-op"
+
+# --- T5b: DELEGATE_LOKI_STATE names the watermark; --state-file beats it -----
+envstate="$tmp/env-state"; flagstate="$tmp/flag-state"
+rm -f "$envstate" "$flagstate" "$tmp/m.loki-sync"
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" DELEGATE_LOKI_STATE="$envstate" \
+  bash "$SCRIPT" --full --metrics-file "$met" --loki-url http://x >/dev/null 2>&1
+assert_eq "4" "$(cat "$envstate" 2>/dev/null)" "T5b: DELEGATE_LOKI_STATE is where the watermark is written"
+[[ -f "$tmp/m.loki-sync" ]] && { echo "  FAIL  T5b: the default path must not be used when the env is set"; fail=$((fail+1)); } || { echo "  PASS  T5b: default path untouched when the env is set"; pass=$((pass+1)); }
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" DELEGATE_LOKI_STATE="$envstate" \
+  bash "$SCRIPT" --full --metrics-file "$met" --state-file "$flagstate" --loki-url http://x >/dev/null 2>&1
+assert_eq "4" "$(cat "$flagstate" 2>/dev/null)" "T5b: --state-file wins over DELEGATE_LOKI_STATE"
+
+# --- T6: a malformed line in the middle is skipped and counted, not fatal ----
+# The parent map used to slurp the whole file, so one bad line anywhere failed
+# every run and the watermark never moved. The good rows must push exactly as
+# they would with the bad line absent.
+met2="$tmp/m2.jsonl"; state2="$tmp/state2"; body2="$tmp/body2.json"
+met2c="$tmp/m2c.jsonl"; state2c="$tmp/state2c"; body2c="$tmp/body2c.json"
+good6a='{"ts":"2026-05-10T10:00:00Z","source":"delegate","tier":"prose","recipe":"commit-message","otel_span_id":"s6","estimated_tokens_avoided":6,"project":"r"}'
+good6b='{"ts":"2026-05-10T10:00:02Z","source":"feedback","ref_ts":"2026-05-10T10:00:00Z","ref_id":"s6","kept":true,"project":"r"}'
+printf '%s\n%s\n%s\n' "$good6a" '{"ts":"2026-05-10T10:00:01Z","source":"delegate"' "$good6b" > "$met2"
+printf '%s\n%s\n' "$good6a" "$good6b" > "$met2c"
+make_mock_curl "$tmp" "$body2c"
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met2c" --state-file "$state2c" --loki-url http://x >/dev/null 2>&1
+make_mock_curl "$tmp" "$body2"
+EC=0
+out=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met2" --state-file "$state2" --loki-url http://x 2>&1) || EC=$?
+assert_eq "0" "$EC" "T6: a malformed middle line does not fail the run"
+assert_contains "skipped 1 malformed line" "$out" "T6: the skipped line is counted on stderr"
+assert_eq "3" "$(cat "$state2" 2>/dev/null)" "T6: watermark advances past the malformed line"
+assert_eq "$(cat "$body2c" 2>/dev/null)" "$(cat "$body2" 2>/dev/null)" \
+  "T6: good rows push byte-identical to a file without the bad line"
+
+# --- T6b: a torn final line (no newline yet) is held back, not skipped past --
+# The sync racing an in-progress delegate.sh append sees a partial last line;
+# it must be retried on the next run once the append completes.
+met6b="$tmp/m6b.jsonl"; state6b="$tmp/state6b"; body6b="$tmp/body6b.json"
+make_mock_curl "$tmp" "$body6b"
+printf '%s\n' "$good6a" > "$met6b"
+printf '%s' '{"ts":"2026-05-10T10:00:01Z","source":"delegate"' >> "$met6b"
+EC=0
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met6b" --state-file "$state6b" --loki-url http://x >/dev/null 2>&1 || EC=$?
+assert_eq "0" "$EC" "T6b: a torn final line does not fail the run"
+assert_eq "1" "$(cat "$state6b" 2>/dev/null)" "T6b: watermark stops before the torn final line"
+printf '%s\n' ',"tier":"code"}' >> "$met6b"
+rm -f "$body6b"
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --metrics-file "$met6b" --state-file "$state6b" --loki-url http://x >/dev/null 2>&1
+assert_eq "code" "$(jq -r '.streams[].values[][1] | fromjson | .tier' "$body6b" 2>/dev/null)" \
+  "T6b: the completed line is pushed on the next run"
+
+# --- T7: valid rows with no usable ts are skipped (advance, no push) --------
+met3="$tmp/m3.jsonl"; state3="$tmp/state3"; body3="$tmp/body3.json"
+make_mock_curl "$tmp" "$body3"
+printf '%s\n' '{"source":"delegate","tier":"prose","project":"r"}' > "$met3"
+EC=0
+out=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met3" --state-file "$state3" --loki-url http://x 2>&1) || EC=$?
+assert_eq "0" "$EC" "T7: no-ts rows -> exit 0"
+assert_contains "no pushable entries" "$out" "T7: warns about skipped rows"
+assert_eq "1" "$(cat "$state3" 2>/dev/null)" "T7: watermark advanced past unsyncable rows"
+if [[ -f "$body3" ]]; then echo "  FAIL  T7: nothing should have been pushed"; fail=$((fail+1)); else echo "  PASS  T7: no push body written"; pass=$((pass+1)); fi
+
+# --- T8: response tempfile is mktemp-based and cleaned up on exit -----------
+# (was a predictable /tmp/loki_push_resp.$$ path; now mktemp + EXIT trap).
+# Point TMPDIR at a fresh dir so any leaked mktemp file is visible.
+tmpd="$tmp/tmpd"; mkdir -p "$tmpd"
+state4="$tmp/state4"; body4="$tmp/body4.json"
+make_mock_curl "$tmp" "$body4"
+EC=0
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" TMPDIR="$tmpd" \
+  bash "$SCRIPT" --full --metrics-file "$met" --state-file "$state4" --loki-url http://x >/dev/null 2>&1 || EC=$?
+assert_eq "0" "$EC" "T8: push run exits 0 with TMPDIR override"
+leftover=$(ls -A "$tmpd" 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "0" "$leftover" "T8: no tempfile leaked in TMPDIR after exit"
+
+# --- T9: the ns timestamp is content-derived, so a row re-pushed at a
+# different line number is not duplicated -----------------------------------
+row9='{"ts":"2026-05-10T11:11:11Z","source":"delegate","tier":"prose","estimated_tokens_avoided":5,"exit_status":0,"project":"repo-z"}'
+met9a="$tmp/m9a.jsonl"; met9b="$tmp/m9b.jsonl"
+state9a="$tmp/s9a"; state9b="$tmp/s9b"; body9a="$tmp/b9a.json"; body9b="$tmp/b9b.json"
+printf '%s\n' "$row9" > "$met9a"                                     # row at line 1
+printf '%s\n%s\n%s\n' \
+  '{"ts":"2026-05-10T11:00:00Z","source":"delegate","tier":"code","project":"a"}' \
+  '{"ts":"2026-05-10T11:00:01Z","source":"delegate","tier":"code","project":"b"}' \
+  "$row9" > "$met9b"                                                 # SAME row at line 3
+make_mock_curl "$tmp" "$body9a"
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" bash "$SCRIPT" --full --metrics-file "$met9a" --state-file "$state9a" --loki-url http://x >/dev/null 2>&1
+make_mock_curl "$tmp" "$body9b"
+env -i PATH="$tmp:$SAFE_PATH" HOME="$HOME" bash "$SCRIPT" --full --metrics-file "$met9b" --state-file "$state9b" --loki-url http://x >/dev/null 2>&1
+ns9a=$(jq -r '.streams[].values[] | select((.[1]|fromjson).project=="repo-z") | .[0]' "$body9a")
+ns9b=$(jq -r '.streams[].values[] | select((.[1]|fromjson).project=="repo-z") | .[0]' "$body9b")
+assert_eq "$ns9a" "$ns9b" "T9: same row -> same ns regardless of file position (re-sync idempotent)"
+
+# --- T10: a payload larger than ARG_MAX still pushes -------------------------
+# A real /usr/bin/curl against a closed port (the bash mock would hit the
+# exec limit itself); the assertion is that stderr never says "Argument
+# list too long".
+row10='{"ts":"2026-05-11T09:00:00Z","source":"delegate","tier":"prose","exit_status":0,"project":"argmax","note":"'"$(printf 'x%.0s' $(seq 1 900))"'"}'
+met10="$tmp/m10.jsonl"; state10="$tmp/s10"
+: > "$met10"
+for _ in $(seq 1 3000); do printf '%s\n' "$row10" >> "$met10"; done
+err10=$(PATH="/usr/bin:/bin" bash "$SCRIPT" --full --metrics-file "$met10" \
+  --state-file "$state10" --loki-url http://127.0.0.1:1 2>&1 >/dev/null)
+case "$err10" in
+  *"Argument list too long"*) echo "  FAIL  T10: >ARG_MAX payload still passed via argv"; fail=$((fail+1));;
+  *) echo "  PASS  T10: >ARG_MAX payload is streamed to curl, not passed via argv"; pass=$((pass+1));;
+esac
+
+# --- T11: push and flush are both bounded ------------------------------------
+# Own directory so the shared $tmp (and its mock curl) stays intact for the
+# cleanup below.
+tmpt=$(mktemp -d)
+argv11="$tmpt/argv.txt"
+make_mock_curl_argv "$tmpt" "$tmpt/body.json" "$argv11"
+met11="$tmpt/m.jsonl"; state11="$tmpt/s"
+cat > "$met11" <<'EOF'
+{"ts":"2026-05-10T10:00:00Z","source":"delegate","tier":"prose","estimated_tokens_avoided":42,"exit_status":0,"project":"repo-x"}
+EOF
+env -i PATH="$tmpt:$SAFE_PATH" HOME="$HOME" \
+  bash "$SCRIPT" --full --metrics-file "$met11" --state-file "$state11" --loki-url http://x >/dev/null 2>&1
+push11=$(grep -- '/loki/api/v1/push' "$argv11")
+flush11=$(grep -- '/flush' "$argv11")
+assert_contains "--max-time 30" "$push11" "T11: push defaults to 30s"
+assert_contains "--connect-timeout 5" "$push11" "T11: push sets --connect-timeout"
+assert_contains "-sS" "$push11" "T11: push keeps curl's error line (-sS, not -s)"
+assert_contains "--max-time 5" "$flush11" "T11: flush uses a fixed 5s"
+rm -rf "$tmpt"
+
+# --- T12: DELEGATE_LOKI_TIMEOUT moves the push bound only ---------------------
+tmpt=$(mktemp -d)
+argv12="$tmpt/argv.txt"
+make_mock_curl_argv "$tmpt" "$tmpt/body.json" "$argv12"
+met12="$tmpt/m.jsonl"; state12="$tmpt/s"
+cat > "$met12" <<'EOF'
+{"ts":"2026-05-10T10:00:00Z","source":"delegate","tier":"prose","estimated_tokens_avoided":42,"exit_status":0,"project":"repo-x"}
+EOF
+env -i PATH="$tmpt:$SAFE_PATH" HOME="$HOME" DELEGATE_LOKI_TIMEOUT=9 \
+  bash "$SCRIPT" --full --metrics-file "$met12" --state-file "$state12" --loki-url http://x >/dev/null 2>&1
+push12=$(grep -- '/loki/api/v1/push' "$argv12")
+flush12=$(grep -- '/flush' "$argv12")
+assert_contains "--max-time 9" "$push12" "T12: push honours DELEGATE_LOKI_TIMEOUT"
+assert_contains "--max-time 5" "$flush12" "T12: flush stays fixed at 5s"
+rm -rf "$tmpt"
+
+rm -rf "$tmp"
+echo
+echo "$pass passed, $fail failed"
+if [[ "$fail" -gt 0 ]]; then exit 1; fi

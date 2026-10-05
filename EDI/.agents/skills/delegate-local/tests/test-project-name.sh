@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Unit tests for delegate_project_name (scripts/lib/otel.sh): a linked
+# worktree attributes to the main repository, not the worktree directory.
+
+set -u
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../scripts/lib/otel.sh
+. "$REPO/scripts/lib/otel.sh"
+
+pass=0
+fail=0
+assert_eq() {
+  if [[ "$1" == "$2" ]]; then echo "  PASS  $3"; pass=$((pass+1))
+  else echo "  FAIL  $3 (expected '$1', got '$2')"; fail=$((fail+1)); fi
+}
+
+if ! command -v git >/dev/null; then
+  echo "  SKIP  git not on PATH"; echo; echo "$pass passed, $fail failed"; exit 0
+fi
+
+tmp=$(mktemp -d)
+# Isolate from the user's global/system git config so the test is hermetic.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
+repo="$tmp/myrepo"
+git init -q "$repo"
+git -C "$repo" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$repo/sub/dir"
+wt="$tmp/wt-feature-x"
+git -C "$repo" worktree add -q "$wt" -b feature-x >/dev/null 2>&1
+
+# T1: from the main repo root → repo basename.
+assert_eq "myrepo" "$(cd "$repo" && delegate_project_name)" "T1: main repo root resolves to repo name"
+
+# T2: from a linked worktree → main repo basename (the fix; pre-fix this was
+# the worktree dir name "wt-feature-x").
+assert_eq "myrepo" "$(cd "$wt" && delegate_project_name)" "T2: linked worktree resolves to main repo name"
+
+# T3: from a nested subdirectory of the main repo → repo basename.
+assert_eq "myrepo" "$(cd "$repo/sub/dir" && delegate_project_name)" "T3: subdirectory resolves to repo name"
+
+# T4: outside any git repo, nothing: a scratch directory's basename is not a
+# project, and a real-looking name matches no boundary lookup (#385).
+outside="$tmp/not-a-repo"
+mkdir -p "$outside"
+assert_eq "" "$(cd "$outside" && delegate_project_name)" "T4: outside a repo yields no project"
+# T4b: and specifically not the scratch-directory name that started this.
+scratch="$tmp/tmp"
+mkdir -p "$scratch"
+assert_eq "" "$(cd "$scratch" && delegate_project_name)" "T4b: a scratch dir is not filed under its basename"
+
+# T4c: a git too old for --git-common-dir (pre-2.5) still resolves via
+# --show-toplevel. The shim answers both subcommands itself and never execs
+# the real git: `VAR=x func` does not export to a function's children.
+shim="$tmp/shim"
+mkdir -p "$shim"
+cat > "$shim/git" <<'SHIMEOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    --git-common-dir) exit 129 ;;
+    --show-toplevel)
+      if [[ -n "${SHIM_TOPLEVEL:-}" ]]; then printf '%s\n' "$SHIM_TOPLEVEL"; exit 0; fi
+      exit 128 ;;
+  esac
+done
+exit 129
+SHIMEOF
+chmod +x "$shim/git"
+assert_eq "myrepo" \
+  "$(cd "$repo" && export PATH="$shim:$PATH" SHIM_TOPLEVEL="$repo" && delegate_project_name)" \
+  "T4c: --show-toplevel still resolves a project when --git-common-dir fails"
+assert_eq "" \
+  "$(cd "$outside" && export PATH="$shim:$PATH" && unset SHIM_TOPLEVEL && delegate_project_name)" \
+  "T4d: the fallback still yields nothing outside a repo"
+
+# T4e: no project is status 0, not the failed test's status 1: delegate.sh
+# runs under `set -e`.
+( cd "$outside" && delegate_project_name >/dev/null )
+assert_eq 0 "$?" "T4e: returning no project is exit status 0"
+
+# T5: an explicit DELEGATE_PROJECT wins over every derivation (#342).
+assert_eq "teams-for-linux" "$(cd "$repo" && DELEGATE_PROJECT=teams-for-linux delegate_project_name)" \
+  "T5: DELEGATE_PROJECT overrides the repo derivation"
+assert_eq "teams-for-linux" "$(cd "$outside" && DELEGATE_PROJECT=teams-for-linux delegate_project_name)" \
+  "T5b: DELEGATE_PROJECT still names the project outside a repo"
+# T6: an empty DELEGATE_PROJECT is not an override — it falls through.
+assert_eq "myrepo" "$(cd "$repo" && DELEGATE_PROJECT= delegate_project_name)" \
+  "T6: empty DELEGATE_PROJECT falls through to the derivation"
+
+git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || true
+rm -rf "$tmp"
+
+echo
+echo "$pass passed, $fail failed"
+if [[ "$fail" -gt 0 ]]; then exit 1; fi

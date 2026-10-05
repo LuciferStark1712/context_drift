@@ -1,0 +1,96 @@
+---
+tier: reasoning
+inputs:
+  stdin: string
+  categories: string
+  output_format: string
+---
+# bulk-classify
+
+## When to use
+
+You have a list of items — open issues, TODO comments, backlog tickets, log lines, changed files — and want each one assigned to exactly one category from a fixed set you supply, one structured line of output per item. The work is closed-form classification into a caller-defined taxonomy: no narrative, no cross-item reasoning, one verdict each. SKILL.md names this shape directly ("Classify each TODO as P0/P1/P2") as a closed prompt local models handle reliably.
+
+This recipe classifies *many* items into one caller-supplied category each. For "what broke in this one log", a single failure log into a few fixed fields, use a bare `reasoning`-tier delegation instead; pick this for "sort these N things into these buckets".
+
+Not for: classification that needs the model to invent the taxonomy ("group these however makes sense" is theme induction, a bare `reasoning`-tier delegation, not a fixed-set assignment), or classification that depends on cross-referencing items against each other (one-item-at-a-time independent assignment is what scales down to local models; cross-reference rules need reasoning-architecture preservation — see SKILL.md's v6 finding).
+
+## Context to gather first
+
+```bash
+# 1. The items — pipe them on stdin as {{stdin}}, one per line or per labelled
+#    block. Number them if the output format references a number.
+gh issue list --state open --limit 50 \
+  --json number,title --jq '.[] | "#\(.number) \(.title)"' \
+  > "$CLAUDE_JOB_DIR/tmp/items.txt"
+
+# 2. The category set and the per-line output format are the caller's decision,
+#    passed via --var categories=... and --var output_format=...
+```
+
+The category set is a closed list and the output format is exact: both are passed as `--var` so the same recipe serves P0/P1/P2 triage, an issue-area taxonomy, or any other fixed-set assignment without editing the recipe.
+
+## Prompt template
+
+```
+Classify each item below into exactly one category from the CATEGORIES list. Assign exactly one category to every item. Do not invent a category outside the list; if an item fits none well, use the closest listed category (or the explicit catch-all category if the list names one).
+
+Rules:
+- Output exactly one line per input item, in the same order as the input. Do not skip an item, do not merge two items into one line, do not add extra lines.
+- The category on each line MUST be one of the CATEGORIES verbatim. Never invent a synonym, abbreviation, or new category.
+- Format each line exactly as: {{output_format}}
+- If an item begins with its own identifier (e.g. `#412`, `JIRA-21`, a numeric id, a filename), reproduce that identifier verbatim in the line. Do NOT replace it with a sequential 1, 2, 3 position index unless the format explicitly asks for the item's ordinal position.
+- Where the format requires verbatim item text, reproduce it exactly as given; do not paraphrase, truncate (unless the format says to), or re-order words.
+- Output ONLY the per-item lines. No header row, no preamble, no commentary, no blank lines between items, no trailing summary. Stop after the last item's line.
+
+=== CATEGORIES (the closed set — every item maps to exactly one of these) ===
+{{categories}}
+
+=== ITEMS (one per line or per labelled block, in order) ===
+{{stdin}}
+```
+
+## Variables
+
+- `{{stdin}}` — the items to classify, piped in, one per line or per labelled block, in the order the output should follow. No `--var` slot needed.
+- `{{categories}}` — the closed category set, as a comma-separated or newline list. Every item is assigned exactly one of these verbatim; the model never invents one outside the set. Name an explicit catch-all (e.g. `other`) if you want unmatched items to land somewhere predictable.
+- `{{output_format}}` — the exact per-line output shape, e.g. `NUMBER | CATEGORY | one-sentence summary` or `<P0|P1|P2>: <verbatim todo>`. Be specific about delimiters and whether the original item text is reproduced verbatim.
+
+## Invocation
+
+```bash
+bash scripts/delegate.sh --recipe bulk-classify \
+  --var categories="display-session-media, auth-network-edge, tray-notifications, packaging, configuration-cli, enhancement, other" \
+  --var output_format='NUMBER | CATEGORY | one-sentence summary' \
+  "One line per item, in order. Category must be one of the listed set verbatim. No headers, no commentary." \
+  < "$CLAUDE_JOB_DIR/tmp/items.txt"
+```
+
+After the call, verify (see Expected output shape) and record the verdict:
+
+```bash
+bash scripts/delegate-feedback.sh hit   # or: miss "<reason>"
+```
+
+## Anti-hallucination guards (each line addresses a recurring miss-mode)
+
+- "The category ... MUST be one of the CATEGORIES verbatim. Never invent a synonym" — the highest-volume failure mode on closed-set classification: the model emits a plausible near-synonym (`config` for `configuration-cli`, `urgent` for `P0`) that breaks any downstream parser. The verbatim-from-the-list discipline is the same closed-list rule the `ci-log-triage` recipe (retired in #616) applied to its FAILURE_TYPE enum.
+- "one line per input item, in the same order ... do not skip an item, do not merge two" — on a long list the prose tier drops or coalesces items, especially near-duplicate ones. The one-line-per-item-in-order rule keeps the output count equal to the input count so a mismatch is immediately visible.
+- "If an item begins with its own identifier ... reproduce that identifier verbatim ... do NOT replace it with a sequential ... index" — a 2026-06-16 cross-model probe on `qwq:32b` renumbered `#412`/`#418` issues as `1, 2, 3` in the NUMBER field, breaking the link back to the source item. The primary reasoning model (`deepseek-r1:32b`) preserved the identifiers; the guard hardens the weaker-model path so the output stays joinable to its input.
+- "if an item fits none well, use the closest listed category (or the explicit catch-all ...)" — the closed-list escape hatch. Without a defined fallback the model invents a new bucket for the awkward item; naming `other` (when the caller lists it) gives the awkward items a predictable home, per the REFUSE/escape-hatch pattern in SKILL.md.
+- "Output ONLY the per-item lines. No header row, no preamble, no trailing summary" — reasoning-tier models otherwise wrap the output in a `## Classification` header or close with a count summary, which the parser then has to strip.
+- The `reasoning` tier (not `prose`) is intentional, the same argument the retired `ci-log-triage` recipe made: classification is filtering and assignment, not prose generation. Per SKILL.md's 2026-05-03 v7 finding, independent per-item classification with priority-ordered keyword rules scales down well to local reasoning models; spell the category boundaries out as hard rules in `--var categories` if the default assignment drifts.
+
+## Expected output shape
+
+```
+#412 | display-session-media | Screen share shows a black window on Wayland.
+#418 | auth-network-edge | SSO login loops when the system clock is skewed.
+#421 | packaging | AppImage fails to launch on Ubuntu 24.04 due to a missing libfuse2.
+```
+
+Verify before recording verdict: exactly one output line per input item, in input order; every category is one of the supplied set verbatim (grep-check against `--var categories` if unsure); each line matches the `output_format` exactly; verbatim item text (where the format requires it) is unparaphrased; no header, preamble, or trailing summary.
+
+## Calibration notes
+
+The dated calibration history for this recipe lives in [`docs/calibration/bulk-classify.md`](../docs/calibration/bulk-classify.md); add each new entry there.

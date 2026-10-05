@@ -1,0 +1,52 @@
+.DS_Store
+*.log
+*.tmp
+__pycache__/
+.venv/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Per-user telemetry written by scripts/delegate.sh. The default metrics path
+# is $HOME/.claude/skills/delegate-local/metrics.jsonl, which resolves
+# through the `npx skills add`-installed symlink back to the repo root for
+# anyone developing the skill while it's installed. The file is private to
+# the user and never belongs in git. The trailing-dot glob also covers the
+# timestamped backups (e.g. metrics.jsonl.bak-20260525) left behind by hand.
+metrics.jsonl
+metrics.jsonl.*
+
+# Per-user overrides: the hand-written config.sh, and the profile written by
+# scripts/onboard.sh (or the derive-flavor.sh redirect). Same symlink-resolution story as metrics.jsonl
+# above: the default paths land in the repo root for anyone developing the
+# skill while it's installed. Private to the user, never in git; the .bak
+# glob covers onboard.sh's timestamped pre-overwrite backups.
+/config.sh
+/config.sh.bak*
+/profile.sh
+/profile.sh.bak*
+
+# Per-cell patched source trees written by session scorers (e.g. scorer-v8.py).
+# Regenerated on every scorer run; the raw model outputs in v*-runs/ are the
+# source of truth, the patched trees are an intermediate artefact.
+experiments/sessions/**/v*-patched/
+
+# Per-run trigger-eval result files (one JSONL per scoring run, timestamped).
+# The directory is kept for tooling discoverability via .gitkeep, but the
+# raw run outputs are local-only — re-runnable on demand.
+evals/results/*.jsonl
+
+# Loki sync watermark, derived as ${metrics_file%.jsonl}.loki-sync by
+# scripts/sync-metrics-to-loki.sh. The metrics.jsonl.* pattern above does not
+# match it.
+metrics.loki-sync
+
+# Verdict stop-hook session markers. They live next to metrics.jsonl, which is
+# now under ~/.local/share/delegate-local — but a checkout that points
+# DELEGATE_METRICS_FILE back here would recreate them, and they are per-session
+# scratch, never content.
+.verdict-stop-markers/
+
+# Other agents' local instruction files. The maintainer keeps an untracked
+# AGENTS.md and .codex/ beside this checkout; CLAUDE.md is the tracked one.
+AGENTS.md
+.codex/

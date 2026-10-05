@@ -1,0 +1,21 @@
+{
+  "name": "delegate-local",
+  "description": "Offload summarisation, drafting, triage, classification and other non-reasoning text work from Claude Code to locally-installed models (MLX, Docker Model Runner or Ollama), keeping content on-device and the main context window free. Saving API tokens is a side effect, not the point.",
+  "version": "0.46.0",
+  "author": {
+    "name": "Ismael Martinez"
+  },
+  "homepage": "https://github.com/IsmaelMartinez/delegate-local",
+  "repository": "https://github.com/IsmaelMartinez/delegate-local",
+  "license": "MIT",
+  "keywords": [
+    "local-models",
+    "ollama",
+    "mlx",
+    "summarisation",
+    "delegation",
+    "skill",
+    "privacy",
+    "on-device"
+  ]
+}

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Unit tests for scripts/validate-skill-content.sh.
+set -u
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$REPO/scripts/validate-skill-content.sh"
+FIX="$REPO/tests/fixtures"
+pass=0; fail=0
+
+EMPTY_ALLOW=$(mktemp); trap 'rm -f "$EMPTY_ALLOW"' EXIT
+
+assert_exit() {
+  local expected="$1" actual="$2" name="$3"
+  if [[ "$expected" == "$actual" ]]; then echo "  PASS  $name"; pass=$((pass+1))
+  else echo "  FAIL  $name (expected $expected got $actual)"; fail=$((fail+1)); fi
+}
+assert_contains() {
+  local needle="$1" haystack="$2" name="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then echo "  PASS  $name"; pass=$((pass+1))
+  else echo "  FAIL  $name (missing '$needle')"; fail=$((fail+1)); fi
+}
+
+# 1. Clean fixture exits 0.
+out=$(ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$FIX/content-clean.md" 2>&1); ec=$?
+assert_exit 0 "$ec" "clean fixture passes"
+
+# 2-8. Each bad category exits 1 and names the right tag.
+for cat in sec_disable sec_permissive cred_exfil obfusc_b64 obfusc_unicode tool_broad url_external conflict_marker; do
+  upper=$(echo "$cat" | tr 'a-z' 'A-Z')
+  out=$(ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$FIX/content-$cat.md" 2>&1); ec=$?
+  assert_exit 1 "$ec" "$cat fixture exits 1"
+  assert_contains "$upper" "$out" "$cat fixture mentions $upper"
+done
+
+# 8a. Unicode tag characters (U+E0000-E007F, ASCII smuggling) and the BOM
+# (U+FEFF) are invisible too and must flag as OBFUSC_UNICODE (#557).
+for variant in tag bom; do
+  out=$(ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$FIX/content-obfusc_unicode_$variant.md" 2>&1); ec=$?
+  assert_exit 1 "$ec" "obfusc_unicode_$variant fixture exits 1"
+  assert_contains "OBFUSC_UNICODE" "$out" "obfusc_unicode_$variant fixture mentions OBFUSC_UNICODE"
+done
+
+# 9. Real SKILL.md must pass with the actual repo allowlist.
+out=$(bash "$SCRIPT" "$REPO/SKILL.md" 2>&1); ec=$?
+assert_exit 0 "$ec" "real SKILL.md passes"
+
+# 10. Allowlist suppresses a hit by line key.
+# Path normalization means keys are repo-root-relative — verify that form works.
+ALLOW=$(mktemp)
+echo "SEC_PERMISSIVE:tests/fixtures/content-sec_permissive.md:2  # test" > "$ALLOW"
+out=$(ALLOW_FILE="$ALLOW" bash "$SCRIPT" "$FIX/content-sec_permissive.md" 2>&1); ec=$?
+assert_exit 0 "$ec" "allowlist suppresses sec_permissive hit by line key"
+rm -f "$ALLOW"
+
+# 11. Allowlist suppresses a hit by sha256 of the offending line content.
+# This form is stable across line-number drift.
+ALLOW=$(mktemp)
+sha=$(printf 'Run with --no-verify and trust-all-certs.' | shasum -a 256 | awk '{print $1}')
+echo "SEC_PERMISSIVE:sha256:$sha  # test" > "$ALLOW"
+out=$(ALLOW_FILE="$ALLOW" bash "$SCRIPT" "$FIX/content-sec_permissive.md" 2>&1); ec=$?
+assert_exit 0 "$ec" "allowlist suppresses sec_permissive hit by sha256 key"
+rm -f "$ALLOW"
+
+# 12-14. URL_EXTERNAL scope (#172): the validator stays file-agnostic but CI
+# and the post-edit hook invoke it on SKILL.md only, since prompts/ cites
+# external sources legitimately.
+
+# 12. The validator itself still flags a file with external URLs.
+out=$(ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$REPO/prompts/README.md" 2>&1); ec=$?
+assert_exit 1 "$ec" "prompts/README.md flags URL_EXTERNAL when validator is pointed at it directly"
+assert_contains "URL_EXTERNAL" "$out" "prompts/README.md hit names URL_EXTERNAL"
+
+# 13. CI workflow only calls the validator with SKILL.md as the argument.
+# Grep for the invocation and assert the arg list is exactly SKILL.md.
+CI_INVOCATIONS=$(grep -E 'validate-skill-content\.sh' "$REPO/.github/workflows/ci.yml" | grep -v '^[[:space:]]*#' || true)
+if [[ -z "$CI_INVOCATIONS" ]]; then
+  echo "  FAIL  CI workflow has no validate-skill-content.sh invocation"; fail=$((fail+1))
+else
+  bad=$(printf '%s\n' "$CI_INVOCATIONS" | grep -vE 'validate-skill-content\.sh SKILL\.md[[:space:]]*$' || true)
+  if [[ -z "$bad" ]]; then
+    echo "  PASS  CI workflow only invokes validate-skill-content.sh on SKILL.md"
+    pass=$((pass+1))
+  else
+    echo "  FAIL  CI workflow invokes validate-skill-content.sh on a file other than SKILL.md:"
+    printf '%s\n' "$bad" | sed 's/^/        /'
+    fail=$((fail+1))
+  fi
+fi
+
+# 14. The post-edit hook calls the validator only inside the case branch for
+# this repo's own SKILL.md ("$repo/SKILL.md"), not any file named SKILL.md.
+HOOK="$REPO/.claude/hooks/post-edit-validate.sh"
+HOOK_INVOCATIONS=$(grep -nE 'validate-skill-content\.sh' "$HOOK" | grep -v '^[[:space:]]*#' || true)
+if [[ -z "$HOOK_INVOCATIONS" ]]; then
+  echo "  FAIL  post-edit hook has no validate-skill-content.sh invocation"; fail=$((fail+1))
+else
+  # Extract line numbers and verify each falls between the "$repo/SKILL.md")
+  # and the next ;; in the case statement.
+  skill_open=$(grep -nF '"$repo/SKILL.md")' "$HOOK" | head -1 | cut -d: -f1)
+  if [[ -z "$skill_open" ]]; then
+    echo "  FAIL  post-edit hook lacks a \"\$repo/SKILL.md\") case branch"; fail=$((fail+1))
+  else
+    skill_close=$(awk -v start="$skill_open" 'NR > start && /;;/ {print NR; exit}' "$HOOK")
+    bad=""
+    while IFS=: read -r ln _; do
+      if (( ln <= skill_open || ln >= skill_close )); then
+        bad="$bad$ln "
+      fi
+    done <<<"$HOOK_INVOCATIONS"
+    if [[ -z "$bad" ]]; then
+      echo "  PASS  post-edit hook only invokes validate-skill-content.sh inside the repo SKILL.md branch"
+      pass=$((pass+1))
+    else
+      echo "  FAIL  post-edit hook invokes validate-skill-content.sh outside the repo SKILL.md branch at line(s): $bad"
+      fail=$((fail+1))
+    fi
+  fi
+fi
+
+# 15-18. DELEGATE_CONTENT_ALLOW_ORG parameterizes the github.com org in the
+# URL allowlist so forks can pass their own org without editing the script.
+
+# 15. Default behaviour unchanged: github.com/IsmaelMartinez URLs pass,
+#     other orgs flag URL_EXTERNAL.
+TMPMD=$(mktemp /tmp/content-org-XXXXXX.md)
+printf '# Fixture\nSee https://github.com/IsmaelMartinez/delegate-local for details.\n' > "$TMPMD"
+out=$(ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$TMPMD" 2>&1); ec=$?
+assert_exit 0 "$ec" "default org: github.com/IsmaelMartinez URL passes"
+printf '# Fixture\nSee https://github.com/SomeOtherOrg/forked-skill for details.\n' > "$TMPMD"
+out=$(ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$TMPMD" 2>&1); ec=$?
+assert_exit 1 "$ec" "default org: github.com/SomeOtherOrg URL flags"
+assert_contains "URL_EXTERNAL" "$out" "default org: other-org hit names URL_EXTERNAL"
+
+# 16. Override allows the fork's org.
+out=$(DELEGATE_CONTENT_ALLOW_ORG=SomeOtherOrg ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$TMPMD" 2>&1); ec=$?
+assert_exit 0 "$ec" "org override: github.com/SomeOtherOrg URL passes"
+
+# 17. Override replaces rather than extends: the upstream org now flags.
+printf '# Fixture\nSee https://github.com/IsmaelMartinez/delegate-local for details.\n' > "$TMPMD"
+out=$(DELEGATE_CONTENT_ALLOW_ORG=SomeOtherOrg ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$TMPMD" 2>&1); ec=$?
+assert_exit 1 "$ec" "org override: upstream org flags under a different org"
+assert_contains "URL_EXTERNAL" "$out" "org override: upstream-org hit names URL_EXTERNAL"
+
+# 18. Regex metacharacters in the override match literally — a value like
+#     ".*" must not widen the allowlist to every github.com URL.
+printf '# Fixture\nSee https://github.com/EvilOrg/payload for details.\n' > "$TMPMD"
+out=$(DELEGATE_CONTENT_ALLOW_ORG='.*' ALLOW_FILE="$EMPTY_ALLOW" bash "$SCRIPT" "$TMPMD" 2>&1); ec=$?
+assert_exit 1 "$ec" "org override: '.*' value cannot widen the allowlist"
+assert_contains "URL_EXTERNAL" "$out" "org override: '.*' hit names URL_EXTERNAL"
+rm -f "$TMPMD"
+
+echo
+echo "$pass passed, $fail failed"
+[[ "$fail" -eq 0 ]]

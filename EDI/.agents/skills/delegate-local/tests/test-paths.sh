@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Where the four per-user files resolve to by default. Every other suite
+# passes an explicit path or sandboxes HOME, so only this one can catch a
+# wrong default.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SAFE_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+pass=0
+fail=0
+assert_eq() {
+  local e="$1" a="$2" n="$3"
+  if [[ "$e" == "$a" ]]; then echo "  PASS  $n"; pass=$((pass+1))
+  else echo "  FAIL  $n (expected '$e', got '$a')"; fail=$((fail+1)); fi
+}
+assert_contains() {
+  local needle="$1" hay="$2" n="$3"
+  if [[ "$hay" == *"$needle"* ]]; then echo "  PASS  $n"; pass=$((pass+1))
+  else echo "  FAIL  $n (missing '$needle' in '$hay')"; fail=$((fail+1)); fi
+}
+
+H=$(mktemp -d)
+trap 'rm -rf "$H"' EXIT
+
+# metrics-summary.sh prints "no metrics file at <path>" when the file is
+# absent, which is the cheapest honest probe of the resolved default.
+probe_metrics() { # extra env assignments...
+  env -i PATH="$SAFE_PATH" HOME="$H" "$@" \
+    bash "$REPO/scripts/metrics-summary.sh" 2>&1 \
+    | sed -n 's/^no metrics file at //p'
+}
+
+echo "--- default resolution ---"
+assert_eq "$H/.local/share/delegate-local/metrics.jsonl" "$(probe_metrics)" \
+  "metrics: defaults under \$HOME/.local/share/delegate-local"
+
+echo "--- overrides ---"
+assert_eq "/tmp/dd-x/metrics.jsonl" "$(probe_metrics DELEGATE_LOCAL_DATA_DIR=/tmp/dd-x)" \
+  "metrics: DELEGATE_LOCAL_DATA_DIR redirects"
+assert_eq "/tmp/explicit.jsonl" "$(probe_metrics DELEGATE_METRICS_FILE=/tmp/explicit.jsonl)" \
+  "metrics: DELEGATE_METRICS_FILE still wins"
+assert_eq "/tmp/explicit.jsonl" \
+  "$(probe_metrics DELEGATE_LOCAL_DATA_DIR=/tmp/dd-x DELEGATE_METRICS_FILE=/tmp/explicit.jsonl)" \
+  "metrics: the file-specific override beats the data dir"
+
+# XDG_DATA_HOME is not consulted: it is set in a shell rc and absent in the
+# GUI-launched agent harness, so honouring it would split the data.
+assert_eq "$H/.local/share/delegate-local/metrics.jsonl" \
+  "$(probe_metrics XDG_DATA_HOME=/tmp/xdg-x)" \
+  "metrics: XDG_DATA_HOME is ignored on purpose"
+
+echo "--- the legacy path is no longer special ---"
+mkdir -p "$H/.claude/skills/delegate-local"
+echo '{"ts":"2026-01-01T00:00:00Z","source":"delegate"}' > "$H/.claude/skills/delegate-local/metrics.jsonl"
+assert_eq "$H/.local/share/delegate-local/metrics.jsonl" "$(probe_metrics)" \
+  "metrics: a legacy file does not divert resolution"
+
+echo "--- an unset HOME still fails loudly ---"
+# Through a shared lib this became a silent success with a path rooted at "/".
+# A parameter expansion under set -u keeps today's loud death.
+out=$(env -i PATH="$SAFE_PATH" bash "$REPO/scripts/metrics-summary.sh" 2>&1); rc=$?
+if (( rc != 0 )); then echo "  PASS  metrics: unset HOME exits non-zero"; pass=$((pass+1))
+else echo "  FAIL  metrics: unset HOME exited 0"; fail=$((fail+1)); fi
+assert_contains "HOME" "$out" "metrics: unset HOME names the variable"
+
+echo "--- a second reader agrees ---"
+# observability-doctor exits early on a missing `docker` under env -i, so it
+# and the other scripts are covered by the structural grep below.
+got=$(env -i PATH="$SAFE_PATH" HOME="$H" bash "$REPO/scripts/sync-metrics-to-loki.sh" 2>&1 \
+      | sed -n 's/.*metrics file not found: //p' | head -1)
+assert_eq "$H/.local/share/delegate-local/metrics.jsonl" "$got" "sync-metrics-to-loki: same default"
+
+echo "--- config.sh and profile.sh ---"
+# pick-model.sh is the only reader of a hand-written config.sh; resolving it
+# needs a provider, so the default is covered structurally.
+onb=$(env -i PATH="$SAFE_PATH" HOME="$H" bash "$REPO/scripts/onboard.sh" 2>&1 || true)
+assert_contains "$H/.local/share/delegate-local/profile.sh" "$onb" \
+  "onboard: profile.sh target under the data dir"
+if grep -q 'config="${DELEGATE_LOCAL_CONFIG:-${DELEGATE_LOCAL_DATA_DIR:-$HOME/.local/share/delegate-local}/config.sh}"' "$REPO/scripts/pick-model.sh"; then
+  echo "  PASS  pick-model: config.sh resolves through the data dir"; pass=$((pass+1))
+else echo "  FAIL  pick-model: config.sh default not on the data dir"; fail=$((fail+1)); fi
+
+echo "--- no script still DEFAULTS to the legacy data path ---"
+# Matches only a `:-` default expansion, since two scripts name the legacy
+# path deliberately in their migration hint.
+leftovers=$(grep -rln ':-\$HOME/\.claude/skills/delegate-local/' "$REPO/scripts/" 2>/dev/null || true)
+assert_eq "" "$leftovers" "scripts: no legacy data-file default remains"
+
+# ...and the hint itself is still present where it should be.
+for s in metrics-summary delegate-feedback; do
+  if grep -q 'onboard.sh --migrate-data' "$REPO/scripts/$s.sh"; then
+    echo "  PASS  $s: points a legacy install at the migration"; pass=$((pass+1))
+  else echo "  FAIL  $s: lost the migration hint"; fail=$((fail+1)); fi
+done
+
+echo
+echo "paths: $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

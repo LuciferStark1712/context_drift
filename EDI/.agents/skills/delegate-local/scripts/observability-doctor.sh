@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# Diagnose (and with --fix recover) the local observability stack when the
+# Grafana dashboards go blank. The recurring failure is a single-binary Loki
+# ring flap after sleep/wake: the ring marks its only member unhealthy and the
+# query path is down until the auto-forget elapses. The load-bearing logic is
+# telling a flap from GENUINE IDLENESS, judged against the metrics FILE: with
+# nothing recent there, an empty panel is expected. Read-only by default; the
+# Tempo path is reported but never touched.
+#
+# Usage:
+#   observability-doctor.sh [--fix] [--loki-url URL] [--metrics-file PATH]
+#                           [--compose-file PATH] [--state-file PATH]
+#
+# Env (shared names with sync-metrics-to-loki.sh so one tuning applies to both):
+#   DELEGATE_LOKI_URL              Loki base URL. Default http://localhost:3100.
+#   DELEGATE_LOCAL_DATA_DIR     where per-user data lives
+#                               (default ~/.local/share/delegate-local)
+#   DELEGATE_METRICS_FILE          metrics JSONL. Default
+#                                  ~/.local/share/delegate-local/metrics.jsonl.
+#   DELEGATE_LOKI_STATE            the sync's watermark file. Default
+#                                  <metrics-file>.loki-sync; --state-file wins.
+#   DELEGATE_GRAFANA_URL           Grafana base URL. Default http://localhost:3001.
+#   DELEGATE_TEMPO_URL             Tempo query API.  Default http://localhost:3200.
+#   DELEGATE_COMPOSE_FILE          compose file. Default <repo>/observability/docker-compose.yml.
+#   DELEGATE_DOCTOR_STALE_SECONDS  recency threshold (default 1800 = 30 min):
+#                                  how old the newest metrics row may be before
+#                                  the dashboards count as legitimately idle.
+#
+# Exit: 0 healthy OR genuinely idle; 1 ring flapped / Loki behind (recoverable,
+#       --fix restarts+resyncs) or Loki's row count differs from what the sync
+#       shipped (recovery printed; --fix does not apply); 2 stack/Loki not
+#       running, usage error, missing dependency, or unreadable metrics file
+#       (operator action, not a flap).
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+loki_url="${DELEGATE_LOKI_URL:-http://localhost:3100}"
+metrics_file="${DELEGATE_METRICS_FILE:-${DELEGATE_LOCAL_DATA_DIR:-$HOME/.local/share/delegate-local}/metrics.jsonl}"
+grafana_url="${DELEGATE_GRAFANA_URL:-http://localhost:3001}"
+tempo_url="${DELEGATE_TEMPO_URL:-http://localhost:3200}"
+compose_file="${DELEGATE_COMPOSE_FILE:-$REPO/observability/docker-compose.yml}"
+stale_seconds="${DELEGATE_DOCTOR_STALE_SECONDS:-1800}"
+state_file="${DELEGATE_LOKI_STATE:-}"
+fix=0
+
+usage() {
+  cat >&2 <<'EOF'
+usage: observability-doctor.sh [--fix] [--loki-url URL] [--metrics-file PATH] [--compose-file PATH] [--state-file PATH]
+  Diagnoses the local Grafana/Tempo/Loki stack when the dashboards go blank.
+  Read-only by default; --fix restarts Loki and re-runs the metrics sync when
+  the Loki ring has flapped (the sleep/wake failure mode). Also compares Loki's
+  row count with what the sync has shipped. Exit 0 healthy/idle, 1 recoverable
+  flap or row-count mismatch, 2 stack down / usage / missing dep.
+EOF
+  exit 2
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --fix) fix=1; shift;;
+    --loki-url)
+      [[ $# -lt 2 || -z "${2:-}" ]] && { echo 'observability-doctor: --loki-url requires a value' >&2; exit 2; }
+      loki_url="$2"; shift 2;;
+    --loki-url=*) loki_url="${1#--loki-url=}"; shift;;
+    --metrics-file)
+      [[ $# -lt 2 || -z "${2:-}" ]] && { echo 'observability-doctor: --metrics-file requires a path' >&2; exit 2; }
+      metrics_file="$2"; shift 2;;
+    --metrics-file=*) metrics_file="${1#--metrics-file=}"; shift;;
+    --compose-file)
+      [[ $# -lt 2 || -z "${2:-}" ]] && { echo 'observability-doctor: --compose-file requires a path' >&2; exit 2; }
+      compose_file="$2"; shift 2;;
+    --compose-file=*) compose_file="${1#--compose-file=}"; shift;;
+    --state-file)
+      [[ $# -lt 2 || -z "${2:-}" ]] && { echo 'observability-doctor: --state-file requires a path' >&2; exit 2; }
+      state_file="$2"; shift 2;;
+    --state-file=*) state_file="${1#--state-file=}"; shift;;
+    -h|--help) usage;;
+    *) echo "observability-doctor: unknown arg '$1'" >&2; usage;;
+  esac
+done
+
+command -v jq     >/dev/null || { echo "observability-doctor: jq not on PATH"     >&2; exit 2; }
+command -v curl   >/dev/null || { echo "observability-doctor: curl not on PATH"   >&2; exit 2; }
+command -v docker >/dev/null || { echo "observability-doctor: docker not on PATH" >&2; exit 2; }
+
+now=$(date +%s)
+
+# --- 1. Is the stack (specifically Loki) up? -------------------------------
+running=$(docker compose -f "$compose_file" ps --status running --format '{{.Service}}' 2>/dev/null)
+if ! printf '%s\n' "$running" | grep -qx 'loki'; then
+  echo "observability-doctor: the Loki container is not running." >&2
+  echo "  Running services: ${running:-(none)}" >&2
+  echo "  Bring the stack up: docker compose -f $compose_file up -d" >&2
+  echo "DOCTOR_SUMMARY: stack=down loki=absent verdict=stack-down"
+  exit 2
+fi
+
+# --- 2. Loki HTTP readiness ------------------------------------------------
+ready_code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "${loki_url%/}/ready" 2>/dev/null || echo "000")
+
+# --- 3. Ring health from recent Loki logs ----------------------------------
+# The sleep/wake signature; plain grep -E (no -P) for portability.
+ring_logsig=0
+if docker compose -f "$compose_file" logs --since 15m loki 2>/dev/null \
+     | grep -E -i 'could only find 0|unhealthy instances|auto-forgetting instance' >/dev/null 2>&1; then
+  ring_logsig=1
+fi
+
+wedged=0
+[[ "$ready_code" != "200" ]] && wedged=1
+(( ring_logsig == 1 )) && wedged=1
+
+# --- 4. Data age: newest row in the FILE vs newest Loki actually serves -----
+if [[ ! -f "$metrics_file" ]]; then
+  echo "observability-doctor: metrics file not found: $metrics_file" >&2
+  echo "  Cannot judge data freshness without it." >&2
+  echo "DOCTOR_SUMMARY: stack=up metrics_file=missing verdict=metrics-file-missing"
+  exit 2
+fi
+
+# Append-only and roughly chronological, so the tail holds the newest ts.
+# Parsed per line, so one malformed row does not blank the whole window.
+file_newest=$(tail -n 200 "$metrics_file" 2>/dev/null | jq -Rn '[inputs | fromjson?]' 2>/dev/null | jq -r '
+  [ .[] | (.ts? // empty)
+    | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime ] | (max // empty)
+' 2>/dev/null)
+
+if [[ -z "$file_newest" ]]; then
+  file_age="n/a"
+  file_recent=0
+else
+  file_age=$(( now - file_newest ))
+  if (( file_age <= stale_seconds )); then file_recent=1; else file_recent=0; fi
+fi
+
+# Best-effort: a wedged Loki returns nothing, which corroborates the flap.
+loki_newest=""
+loki_body=$(curl -s -m 5 -G "${loki_url%/}/loki/api/v1/query_range" \
+  --data-urlencode 'query={service="delegate-local"}' \
+  --data-urlencode 'direction=backward' \
+  --data-urlencode 'limit=1' 2>/dev/null || true)
+if [[ -n "$loki_body" ]]; then
+  loki_newest=$(printf '%s' "$loki_body" | jq -r '
+    [ .data.result[]?.values[]?[0] | tonumber ] | (max // null)
+    | if . == null then "" else (. / 1000000000 | floor) end
+  ' 2>/dev/null || echo "")
+fi
+if [[ -n "$loki_newest" ]]; then loki_age=$(( now - loki_newest )); else loki_age="n/a"; fi
+
+# "Behind": the file has recent rows but Loki's newest is missing or lags by
+# more than the staleness window.
+loki_behind=0
+if (( file_recent == 1 )); then
+  if [[ -z "$loki_newest" ]]; then
+    loki_behind=1
+  elif (( file_newest - loki_newest > stale_seconds )); then
+    loki_behind=1
+  fi
+fi
+
+# --- 5. Cardinality: rows Loki holds vs rows the sync has shipped ---------
+# Freshness cannot see history stored twice: the 2026-06-19 dedup-key change
+# left every earlier row in Loki under both its old and its new timestamp and
+# every panel read healthy. The sync's watermark says how many lines it has
+# shipped; those lines' distinct well-formed rows with a valid ts are what
+# Loki should hold, since it de-duplicates identical (timestamp, line) pairs.
+# Skipped (n/a) while the query path is down, when the sync has never run on
+# this file, or when Loki gives no count; a sync racing this check can read
+# as a transient mismatch, so re-run before acting on one.
+# Resolved as the sync resolves it: --state-file, DELEGATE_LOKI_STATE, default.
+[[ -z "$state_file" ]] && state_file="${metrics_file%.jsonl}.loki-sync"
+ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+shipped_rows="n/a"
+loki_rows="n/a"
+shipped_oldest=""
+watermark=$(cat "$state_file" 2>/dev/null || true)
+if (( wedged == 0 )) && [[ "$watermark" =~ ^[0-9]+$ ]] && (( watermark > 0 )); then
+  shipped=$(head -n "$watermark" "$metrics_file" | jq -Rn '[inputs | fromjson?]' 2>/dev/null | jq -r --arg re "$ts_re" '
+    [ .[] | select(type == "object" and (.ts | type) == "string" and (.ts | test($re))) ]
+    | "\(map(tojson) | unique | length) \(map(.ts) | min // "")"
+  ' 2>/dev/null)
+  shipped_rows="${shipped%% *}"
+  shipped_oldest="${shipped#* }"
+  [[ "$shipped_rows" =~ ^[0-9]+$ ]] || shipped_rows="n/a"
+fi
+if [[ "$shipped_rows" != "n/a" && "$shipped_rows" != "0" && -n "$shipped_oldest" ]]; then
+  oldest_epoch=$(jq -rn --arg t "$shipped_oldest" '$t | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime' 2>/dev/null)
+  if [[ "$oldest_epoch" =~ ^[0-9]+$ ]]; then
+    # Instant query over a range reaching an hour past the oldest shipped row.
+    range_s=$(( now - oldest_epoch + 3600 ))
+    count_body=$(curl -s -m 10 -G "${loki_url%/}/loki/api/v1/query" \
+      --data-urlencode "query=sum(count_over_time({service=\"delegate-local\"}[${range_s}s]))" \
+      --data-urlencode "time=${now}000000000" 2>/dev/null || true)
+    loki_rows=$(printf '%s' "$count_body" | jq -r '
+      if .status == "success" then ((.data.result[0].value[1] // "0") | tonumber | floor | tostring) else "n/a" end
+    ' 2>/dev/null)
+    [[ "$loki_rows" =~ ^[0-9]+$ ]] || loki_rows="n/a"
+  fi
+fi
+cardinality_mismatch=0
+if [[ "$loki_rows" != "n/a" && "$shipped_rows" != "n/a" && "$loki_rows" != "$shipped_rows" ]]; then
+  cardinality_mismatch=1
+fi
+
+# --- 6. Grafana / Tempo reachability (report-only) -------------------------
+grafana_code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "${grafana_url%/}/api/health" 2>/dev/null || echo "000")
+tempo_code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "${tempo_url%/}/ready" 2>/dev/null || echo "000")
+[[ "$grafana_code" == "200" ]] || echo "observability-doctor: note — Grafana /api/health returned $grafana_code (dashboards UI may be down independently of Loki)." >&2
+[[ "$tempo_code" == "200" ]]   || echo "observability-doctor: note — Tempo /ready returned $tempo_code (live trace path; independent of the Loki ring)." >&2
+
+summary() {
+  echo "DOCTOR_SUMMARY: stack=up ready=$ready_code ring_logsig=$ring_logsig file_age_s=$file_age loki_age_s=$loki_age loki_rows=$loki_rows shipped_rows=$shipped_rows verdict=$1"
+}
+
+# --- 7. Verdict ------------------------------------------------------------
+# Checked before idleness: doubled history is old history, and --fix cannot
+# repair it, since a restart and re-sync add rows and never remove any.
+if (( cardinality_mismatch == 1 )); then
+  if (( loki_rows > shipped_rows )); then
+    echo "observability-doctor: Loki holds $loki_rows rows but the sync has shipped $shipped_rows distinct rows — history is stored more than once (a changed dedup key orphans every earlier row), so dashboard counts and rates are inflated." >&2
+    echo "  Recover by wiping Loki and re-syncing from zero:" >&2
+    echo "    docker compose -f $compose_file rm -sf loki" >&2
+    echo "    docker volume rm delegate-local-observability_loki-data" >&2
+    echo "    docker compose -f $compose_file up -d loki" >&2
+    echo "    bash scripts/sync-metrics-to-loki.sh --full" >&2
+  else
+    echo "observability-doctor: Loki holds $loki_rows rows but the sync has shipped $shipped_rows distinct rows — rows are missing (a wiped volume with the watermark left in place?)." >&2
+    echo "  Recover by re-pushing every row: bash scripts/sync-metrics-to-loki.sh --full" >&2
+  fi
+  summary "cardinality-mismatch"
+  exit 1
+fi
+
+if (( file_recent == 0 )); then
+  if (( wedged == 1 )); then
+    echo "observability-doctor: no delegations in the last $((stale_seconds/60))m, so a blank recent-window panel is expected — not a flap. Loki's ring is currently re-forming (ready=$ready_code); with nothing recent to chart this is not data loss and it will self-heal. Re-run after new delegations if a panel stays blank." >&2
+  else
+    echo "observability-doctor: healthy-idle — no delegations in the last $((stale_seconds/60))m, so an empty recent-window panel is expected, not a fault. Loki is ready and the trace path is up." >&2
+  fi
+  summary "idle"
+  exit 0
+fi
+
+if (( wedged == 0 && loki_behind == 0 )); then
+  echo "observability-doctor: healthy — Loki is ready, the ring is clean, and Loki's newest data tracks the metrics file (file_age=${file_age}s, loki_age=${loki_age}s)." >&2
+  summary "healthy"
+  exit 0
+fi
+
+# Recoverable: either the ring flapped or the sync fell behind, and there IS
+# recent data that should be visible.
+if (( wedged == 1 )); then
+  echo "observability-doctor: Loki ring flap detected (ready=$ready_code, log-signature=$ring_logsig) while recent delegations exist — the query path is down so the dashboards are blank." >&2
+else
+  echo "observability-doctor: Loki is ready but its newest data lags the metrics file by $((file_newest - loki_newest))s — the sync fell behind." >&2
+fi
+
+if (( fix == 0 )); then
+  echo "  Recover by either waiting out the ~10-minute ring auto-forget, or re-run with --fix to restart Loki and re-sync now:" >&2
+  echo "    bash scripts/observability-doctor.sh --fix" >&2
+  summary "wedged-recoverable"
+  exit 1
+fi
+
+# --fix: restart Loki to rejoin the ring fresh, wait for /ready, re-sync.
+echo "observability-doctor: --fix — restarting Loki and re-running the metrics sync..." >&2
+docker compose -f "$compose_file" restart loki >/dev/null 2>&1 || {
+  echo "observability-doctor: 'docker compose restart loki' failed." >&2
+  summary "fix-restart-failed"
+  exit 1
+}
+ready_after=""
+i=0
+while (( i < 30 )); do
+  ready_after=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "${loki_url%/}/ready" 2>/dev/null || echo "000")
+  [[ "$ready_after" == "200" ]] && break
+  sleep 2
+  i=$((i + 1))
+done
+if [[ "$ready_after" != "200" ]]; then
+  echo "observability-doctor: Loki did not return ready within the timeout (last ready=$ready_after); check 'docker compose -f $compose_file logs loki'." >&2
+  summary "fix-ready-timeout"
+  exit 1
+fi
+# The sync is best-effort; its stderr is let through and a failure warns
+# rather than claims "recovered".
+ready_code="$ready_after"
+if DELEGATE_LOKI_URL="$loki_url" DELEGATE_METRICS_FILE="$metrics_file" DELEGATE_LOKI_STATE="$state_file" \
+     bash "$REPO/scripts/sync-metrics-to-loki.sh" >/dev/null; then
+  echo "observability-doctor: recovered — Loki is ready again and the sync has re-run." >&2
+else
+  echo "observability-doctor: Loki is ready again, but the metrics sync failed (see its stderr above); data may be stale until the next successful sync." >&2
+fi
+summary "recovered"
+exit 0

@@ -1,0 +1,740 @@
+#!/usr/bin/env bash
+# Unit tests for pick-model.sh and audit-models.sh, against mock
+# binaries on a restricted PATH.
+
+set -u
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PICK="$SKILL_DIR/scripts/pick-model.sh"
+AUDIT="$SKILL_DIR/scripts/audit-models.sh"
+SAFE_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+pass=0
+fail=0
+
+assert_eq() {
+  local expected="$1" actual="$2" name="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    echo "  PASS  $name"
+    pass=$((pass+1))
+  else
+    echo "  FAIL  $name"
+    echo "        expected: '$expected'"
+    echo "        actual:   '$actual'"
+    fail=$((fail+1))
+  fi
+}
+
+assert_contains() {
+  local needle="$1" haystack="$2" name="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  PASS  $name"
+    pass=$((pass+1))
+  else
+    echo "  FAIL  $name"
+    echo "        expected substring: '$needle'"
+    echo "        in: '$haystack'"
+    fail=$((fail+1))
+  fi
+}
+
+# Mock curl answering GET {base}/models. $2 is a space-separated "port:id,id"
+# spec: a port absent from it exits 7 (unreachable), a port with no ids
+# answers an empty list (reachable, serving nothing).
+make_mock_provider() {
+  local dir="$1" spec="$2"
+  cat > "$dir/curl" <<EOF
+#!/usr/bin/env bash
+url=""
+for a in "\$@"; do case "\$a" in http*) url="\$a" ;; esac; done
+port=\$(printf '%s' "\$url" | sed -n 's|.*://[^:/]*:\([0-9]*\).*|\1|p')
+for entry in ${spec}; do
+  p="\${entry%%:*}"; ids="\${entry#*:}"
+  if [[ "\$p" == "\$port" ]]; then
+    printf '{"object":"list","data":['
+    if [[ -n "\$ids" ]]; then
+      first=1
+      IFS=, read -ra arr <<< "\$ids"
+      for id in "\${arr[@]}"; do
+        if (( first == 0 )); then printf ','; fi
+        printf '{"id":"%s","object":"model"}' "\$id"
+        first=0
+      done
+    fi
+    printf ']}'
+    exit 0
+  fi
+done
+exit 7
+EOF
+  chmod +x "$dir/curl"
+}
+
+# audit-models.sh needs an llmfit stub.
+make_mock_llmfit() {
+  local dir="$1"
+  cat > "$dir/llmfit" <<'EOF'
+#!/usr/bin/env bash
+# Minimal stub: any `recommend --json` prints an empty model list.
+if [[ "$*" == *--json* ]]; then echo '{"models":[]}'; else echo ""; fi
+EOF
+  chmod +x "$dir/llmfit"
+}
+
+run() {
+  # run <PATH> <cmd...> -> $OUT, $ERR, $EC. HOME is sandboxed so a real
+  # per-user override config cannot leak in; DELEGATE_LOCAL_CONFIG is forwarded.
+  local custom_path="$1"; shift
+  local sandbox_home; sandbox_home=$(mktemp -d)
+  # One provider on port 1, so a "1:..." mock spec answers it and a test with
+  # no mock hits a closed port that refuses instantly.
+  local extra=(DELEGATE_BASE_URL=http://localhost:1/v1)
+  if [[ -n "${DELEGATE_LOCAL_CONFIG:-}" ]]; then
+    extra+=(DELEGATE_LOCAL_CONFIG="$DELEGATE_LOCAL_CONFIG")
+  fi
+  local err_file; err_file=$(mktemp)
+  OUT=$(env -i PATH="$custom_path" HOME="$sandbox_home" ${extra[@]+"${extra[@]}"} "$@" 2>"$err_file") || EC=$?
+  EC=${EC:-0}
+  ERR=$(cat "$err_file")
+  rm -f "$err_file"
+  rm -rf "$sandbox_home"
+}
+
+echo "=== pick-model.sh ==="
+
+# 1. Missing argument -> usage error (exit 2).
+tmp=$(mktemp -d)
+EC=0; run "$SAFE_PATH" bash "$PICK" || true
+assert_eq "2" "$EC" "no args exits 2"
+rm -rf "$tmp"
+
+# 2. Unknown tier -> exit 2.
+EC=0; run "$SAFE_PATH" bash "$PICK" bogus || true
+assert_eq "2" "$EC" "unknown tier exits 2"
+
+# 3. No provider answering -> exit 1 with clear message.
+EC=0; run "$SAFE_PATH" bash "$PICK" code || true
+assert_eq "1" "$EC" "no provider reachable -> exit 1"
+assert_contains "no provider is reachable" "$ERR" "no provider reachable -> informative stderr"
+
+# 4. Empty model list -> exit 1.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" code || true
+assert_eq "1" "$EC" "provider serving nothing -> exit 1"
+rm -rf "$tmp"
+
+# 5. Code tier with coder installed returns it.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3-coder:30b-a3b-q8_0,gemma4:latest"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" code || true
+assert_eq "0" "$EC" "code tier exits 0"
+assert_eq "qwen3-coder:30b-a3b-q8_0" "$OUT" "code tier picks qwen3-coder"
+rm -rf "$tmp"
+
+# 6. Prose tier with only gemma4 falls back to gemma4.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:gemma4:latest"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "gemma4:latest" "$OUT" "prose falls to gemma4 when no qwen3.6"
+rm -rf "$tmp"
+
+# 7. Prose tier prefers qwen3.6 when installed (the new preference).
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,gemma4:latest"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "qwen3.6:35b-a3b" "$OUT" "prose picks qwen3.6 when installed"
+rm -rf "$tmp"
+
+# 7b. Prose tier prefers qwen3.6 over qwen3-next when both are installed.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,qwen3-next:80b-a3b-instruct-q8_0"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "qwen3.6:35b-a3b" "$OUT" "prose picks qwen3.6 ahead of qwen3-next"
+rm -rf "$tmp"
+
+# 8. No preference match -> exit 1 (do NOT return an arbitrary fallback).
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:unrelated:model"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" code || true
+assert_eq "1" "$EC" "no match -> exit 1"
+rm -rf "$tmp"
+
+# 9. long-context tier prefers qwen3.6 when available.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,llama4:scout"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" long-context || true
+assert_eq "qwen3.6:35b-a3b" "$OUT" "long-context picks qwen3.6 first"
+rm -rf "$tmp"
+
+# 10. --dry-run with a matching install: stdout = model, stderr has the trace.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,gemma4:latest"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" --dry-run prose || true
+assert_eq "0" "$EC" "dry-run match -> exit 0"
+assert_eq "qwen3.6:35b-a3b" "$OUT" "dry-run match -> stdout still has model"
+assert_contains "dry-run: tier=prose" "$ERR" "dry-run match -> stderr has tier line"
+assert_contains "matched preference='qwen3.6'" "$ERR" "dry-run match -> stderr names matched preference"
+rm -rf "$tmp"
+
+# 11. --dry-run with no matching install: exit 1, stderr explains why.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:unrelated:model"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" --dry-run code || true
+assert_eq "1" "$EC" "dry-run no match -> exit 1"
+assert_contains "no model matches this tier" "$ERR" "dry-run no match -> stderr explains why"
+rm -rf "$tmp"
+
+# 12. --dry-run without a tier arg: usage error (exit 2).
+EC=0; run "$SAFE_PATH" bash "$PICK" --dry-run || true
+assert_eq "2" "$EC" "dry-run no tier -> exit 2"
+assert_contains "usage:" "$ERR" "dry-run no tier -> usage on stderr"
+
+# 13. Unknown flag: usage error (exit 2) with informative stderr.
+EC=0; run "$SAFE_PATH" bash "$PICK" --bogus prose || true
+assert_eq "2" "$EC" "unknown flag -> exit 2"
+assert_contains "unknown option: --bogus" "$ERR" "unknown flag -> stderr names the bad option"
+
+# 14. vision tier picks qwen3-vl thinking model when installed.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3-vl:30b-a3b-thinking"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" vision || true
+assert_eq "qwen3-vl:30b-a3b-thinking" "$OUT" "vision picks qwen3-vl thinking variant"
+rm -rf "$tmp"
+
+# 15. embedding tier picks nomic-embed-text when installed.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:nomic-embed-text"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" embedding || true
+assert_eq "nomic-embed-text" "$OUT" "embedding picks nomic-embed-text"
+rm -rf "$tmp"
+
+# 16. embedding tier falls back to bge-large when nomic absent.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:bge-large"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" embedding || true
+assert_eq "bge-large" "$OUT" "embedding falls back to bge-large"
+rm -rf "$tmp"
+
+# 17. premium-general tier picks qwen3.5 122b variant when installed.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.5:122b-a10b-q4_K_M"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" premium-general || true
+assert_eq "qwen3.5:122b-a10b-q4_K_M" "$OUT" "premium-general picks qwen3.5:122b"
+rm -rf "$tmp"
+
+# 18. premium-general does NOT silently downshift to qwen3.5:27b.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.5:27b"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" premium-general || true
+assert_eq "1" "$EC" "premium-general -> exit 1 when only smaller qwen3.5 installed"
+rm -rf "$tmp"
+
+# 19. reasoning-vision picks phi4-reasoning-vision when installed.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:phi4-reasoning-vision:15b"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" reasoning-vision || true
+assert_eq "phi4-reasoning-vision:15b" "$OUT" "reasoning-vision picks phi4-reasoning-vision"
+rm -rf "$tmp"
+
+# 20. reasoning-vision falls back to qwen3-vl thinking when phi4 absent.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3-vl:30b-a3b-thinking"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" reasoning-vision || true
+assert_eq "qwen3-vl:30b-a3b-thinking" "$OUT" "reasoning-vision falls back to qwen3-vl thinking"
+rm -rf "$tmp"
+
+# 20b. reasoning prefers deepseek-r1 over phi4-reasoning (baseline-measured).
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:deepseek-r1:32b,phi4-reasoning:plus"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" reasoning || true
+assert_eq "deepseek-r1:32b" "$OUT" "reasoning picks deepseek-r1 ahead of phi4-reasoning"
+rm -rf "$tmp"
+
+echo
+echo "=== pick-model.sh override (Phase 9) ==="
+
+# 21. An override file that reorders prefs wins.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,gemma4:latest"
+cat > "$tmp/config.sh" <<'EOF'
+case "$tier" in
+  prose) prefs=("gemma4" "qwen3.6") ;;
+esac
+EOF
+EC=0
+DELEGATE_LOCAL_CONFIG="$tmp/config.sh" run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "gemma4:latest" "$OUT" "override reorders prose to gemma4 first"
+unset DELEGATE_LOCAL_CONFIG
+rm -rf "$tmp"
+
+# 22. Override that only touches one tier leaves other tiers on shipped defaults.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3-coder:30b,qwen3.6:35b-a3b"
+cat > "$tmp/config.sh" <<'EOF'
+case "$tier" in
+  prose) prefs=("not-installed-model") ;;
+esac
+EOF
+EC=0
+DELEGATE_LOCAL_CONFIG="$tmp/config.sh" run "$tmp:$SAFE_PATH" bash "$PICK" code || true
+assert_eq "qwen3-coder:30b" "$OUT" "override leaves untouched tiers using shipped defaults"
+unset DELEGATE_LOCAL_CONFIG
+rm -rf "$tmp"
+
+# 23. Override file absent: defaults resolve exactly as before.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b"
+EC=0
+DELEGATE_LOCAL_CONFIG="$tmp/does-not-exist.sh" run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "qwen3.6:35b-a3b" "$OUT" "missing override file -> shipped defaults still resolve"
+unset DELEGATE_LOCAL_CONFIG
+rm -rf "$tmp"
+
+# 23b. World-writable override is rejected with a warning; shipped defaults win.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,gemma4:latest"
+cat > "$tmp/config.sh" <<'EOF'
+case "$tier" in
+  prose) prefs=("gemma4" "qwen3.6") ;;
+esac
+EOF
+chmod 666 "$tmp/config.sh"
+EC=0
+DELEGATE_LOCAL_CONFIG="$tmp/config.sh" run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "qwen3.6:35b-a3b" "$OUT" "world-writable override is ignored, shipped defaults win"
+assert_contains "group/world-writable" "$ERR" "world-writable override produces warning on stderr"
+unset DELEGATE_LOCAL_CONFIG
+rm -rf "$tmp"
+
+# 24. --dry-run surfaces the override in the trace so users can debug it.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,gemma4:latest"
+cat > "$tmp/config.sh" <<'EOF'
+case "$tier" in
+  prose) prefs=("gemma4" "qwen3.6") ;;
+esac
+EOF
+EC=0
+DELEGATE_LOCAL_CONFIG="$tmp/config.sh" run "$tmp:$SAFE_PATH" bash "$PICK" --dry-run prose || true
+assert_contains "sourcing override:" "$ERR" "dry-run names the override file"
+assert_contains "post-override" "$ERR" "dry-run surfaces post-override prefs"
+unset DELEGATE_LOCAL_CONFIG
+rm -rf "$tmp"
+
+# 25. The legacy DELEGATE_TO_OLLAMA_CONFIG name is no longer read (#567): an
+# override it names would reorder prose to gemma4, and must not.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b,gemma4:latest"
+cat > "$tmp/config.sh" <<'EOF'
+case "$tier" in
+  prose) prefs=("gemma4" "qwen3.6") ;;
+esac
+EOF
+EC=0
+run "$tmp:$SAFE_PATH" env DELEGATE_TO_OLLAMA_CONFIG="$tmp/config.sh" bash "$PICK" prose || true
+assert_eq "qwen3.6:35b-a3b" "$OUT" "legacy DELEGATE_TO_OLLAMA_CONFIG is ignored"
+rm -rf "$tmp"
+
+echo
+echo "=== audit-models.sh ==="
+
+# A. Nothing reachable is a report, not a failure.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" ""
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_eq "0" "$EC" "audit: no provider reachable -> exit 0"
+assert_contains "unreachable" "$OUT" "audit: no provider reachable -> marks the provider unreachable"
+rm -rf "$tmp"
+
+# B. Provider present, llmfit missing -> graceful skip, exit 0.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3-coder:30b,gemma4:latest"
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_eq "0" "$EC" "audit: no llmfit -> exit 0"
+assert_contains "Upgrade check skipped" "$OUT" "audit: no llmfit -> skip message"
+rm -rf "$tmp"
+
+# The "no jq" path is not simulated: macOS 15+ ships /usr/bin/jq.
+
+echo
+echo "=== pick-model.sh: --print-providers / --print-installed ==="
+
+# Both surfaces answer without a tier argument.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b-q8_0,gemma4:latest"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" --print-providers || true
+assert_eq "0" "$EC" "--print-providers exits 0 without a tier"
+assert_eq "http://localhost:1/v1" "$OUT" "--print-providers prints the pinned list"
+
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" --print-installed || true
+assert_eq "0" "$EC" "--print-installed exits 0 without a tier"
+assert_eq "gemma4:latest
+qwen3.6:35b-a3b-q8_0" "$OUT" "--print-installed lists what the provider serves"
+rm -rf "$tmp"
+
+# The default list is built from the host variables, not literal ports.
+EC=0
+OUT=$(env -i PATH="$SAFE_PATH" HOME="$tmp" \
+  MLX_HOST=http://mlx.test:1234 \
+  DOCKER_MODEL_HOST=http://docker.test:2345 \
+  OLLAMA_HOST=http://ollama.test:3456 \
+  bash "$PICK" --print-providers 2>/dev/null) || EC=$?
+assert_eq "http://mlx.test:1234/v1
+http://docker.test:2345/engines/v1
+http://ollama.test:3456/v1" "$OUT" "--print-providers honours MLX_HOST / DOCKER_MODEL_HOST / OLLAMA_HOST"
+
+# The shipped default, with no host variables set at all.
+EC=0
+OUT=$(env -i PATH="$SAFE_PATH" HOME="$tmp" bash "$PICK" --print-providers 2>/dev/null) || EC=$?
+assert_eq "http://localhost:8080/v1
+http://localhost:12434/engines/v1
+http://localhost:11434/v1" "$OUT" "--print-providers defaults to MLX, Docker Model Runner, Ollama in that order"
+
+# "Nothing reachable" and "reachable but no tier match" need opposite
+# remedies, so they are reported apart.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" ""
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "1" "$EC" "no provider reachable -> exit 1"
+assert_contains "no provider is reachable" "$ERR" "no provider reachable -> says so"
+rm -rf "$tmp"
+
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:unrelated:model"
+EC=0; run "$tmp:$SAFE_PATH" bash "$PICK" prose || true
+assert_eq "1" "$EC" "reachable but no tier match -> exit 1"
+assert_contains "no provider holds a model for tier 'prose'" "$ERR" "reachable but no tier match -> names the tier"
+rm -rf "$tmp"
+
+echo
+echo "=== audit-models.sh: provider awareness ==="
+
+# The audit names the providers it reports on (#344).
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3-coder:30b"
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_eq "0" "$EC" "audit: reachable provider -> exit 0"
+assert_contains "reachable" "$OUT" "audit: reports provider reachability"
+assert_contains "qwen3-coder:30b" "$OUT" "audit: inventory is what the provider serves"
+assert_contains "reasoning-vision" "$OUT" "audit: routing table covers the scaffolded tiers"
+rm -rf "$tmp"
+
+# No ollama binary still gets the full report, upgrade check included: the
+# cross-check reads what the providers serve, not `ollama list` (#492), so an
+# MLX- or Docker-only host is no longer told the check was skipped.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b-q8_0"
+make_mock_llmfit "$tmp"
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_eq "0" "$EC" "audit: no ollama binary -> exit 0"
+assert_contains "prose" "$OUT" "audit: still prints tier routing without the ollama CLI"
+assert_contains "Top llmfit recommendations" "$OUT" "audit: the upgrade check runs without the ollama CLI (#492)"
+assert_absent_out() { case "$OUT" in *"$1"*) echo "  FAIL  $2"; fail=$((fail+1));; *) echo "  PASS  $2"; pass=$((pass+1));; esac; }
+assert_absent_out "Upgrade check skipped" "audit: no ollama is not a reason to skip the upgrade check (#492)"
+rm -rf "$tmp"
+
+# [installed] is judged against the provider inventory: an llmfit candidate
+# whose stem matches a served model is installed, one that does not is not.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b-q8_0"
+cat > "$tmp/llmfit" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *--json* ]]; then
+  echo '{"models":[{"name":"Qwen/Qwen3.6-35B-A3B-Instruct-Q8_0","provider":"Qwen","score":90,"estimated_tps":40,"parameter_count":"35B","release_date":"2026-01-01"},{"name":"Qwen/Qwen2.5-Coder-7B-Instruct","provider":"Qwen","score":80,"estimated_tps":80,"parameter_count":"7.6B","release_date":"2025-01-01"}]}'
+else echo ""; fi
+EOF
+chmod +x "$tmp/llmfit"
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_contains "Qwen/Qwen3.6-35B-A3B-Instruct-Q8_0  [installed]" "$OUT" "audit: a served model is [installed] whichever provider serves it (#492)"
+assert_contains "Qwen/Qwen2.5-Coder-7B-Instruct  [not installed]" "$OUT" "audit: an unserved candidate is [not installed]"
+assert_contains "No strong upgrades found" "$OUT" "audit: the installed leader beats the candidate, so nothing is suggested"
+rm -rf "$tmp"
+
+# llmfit is asked once per distinct argument list: prose, reasoning and
+# long-context all map to the "general" use-case, so three identical calls
+# collapsed to one (#565); only code maps to "coding".
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:qwen3.6:35b-a3b-q8_0"
+cat > "$tmp/llmfit" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$tmp/llmfit.calls"
+if [[ "\$*" == *--json* ]]; then echo '{"models":[]}'; else echo ""; fi
+EOF
+chmod +x "$tmp/llmfit"
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_eq "2" "$(wc -l < "$tmp/llmfit.calls" | tr -d ' ')" "audit: llmfit runs once per distinct use-case, not once per tier (#565)"
+assert_eq "1" "$(grep -c -- '--use-case general' "$tmp/llmfit.calls")" "audit: the three general-use-case tiers share one llmfit call"
+assert_eq "$(sort -u "$tmp/llmfit.calls" | wc -l | tr -d ' ')" "$(wc -l < "$tmp/llmfit.calls" | tr -d ' ')" "audit: no llmfit argument list is repeated"
+rm -rf "$tmp"
+
+# The embedding tier resolves like every other tier, with no per-tier
+# provider pin (#357).
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "1:nomic-embed-text:v1.5"
+EC=0; run "$tmp:$SAFE_PATH" bash "$AUDIT" || true
+assert_contains "nomic-embed-text" "$OUT" "audit: embedding tier resolves like any other tier"
+assert_absent_out "embed.sh pins it" "audit: no per-tier provider pin is advertised"
+rm -rf "$tmp"
+
+echo
+echo "=== no installer-breaking AAIF self-symlink ==="
+
+# A symlink under .agents/skills/ resolving to the repo root makes `npx skills
+# add` recurse until ENAMETOOLONG, silently; the root SKILL.md is the install source.
+SELF_LINK="$SKILL_DIR/.agents/skills/delegate-local"
+if [[ -L "$SELF_LINK" ]] && \
+   [[ "$(cd "$(dirname "$SELF_LINK")" && cd "$(readlink "$SELF_LINK" 2>/dev/null)" 2>/dev/null && pwd -P)" == "$(cd "$SKILL_DIR" && pwd -P)" ]]; then
+  echo "  FAIL  .agents/skills/delegate-local symlinks the repo root (re-creates the npx install recursion)"
+  fail=$((fail+1))
+else
+  echo "  PASS  no repo-root self-symlink under .agents/skills/"
+  pass=$((pass+1))
+fi
+if [[ -f "$SKILL_DIR/SKILL.md" ]]; then
+  echo "  PASS  root SKILL.md present (the location the installer copies from)"
+  pass=$((pass+1))
+else
+  echo "  FAIL  root SKILL.md missing"
+  fail=$((fail+1))
+fi
+
+echo
+echo "=== commit-message body-drop bench (wiring smoke — no model contact) ==="
+
+# Offline: never runs the bench. The live gate is opt-in:
+#   BENCH_GATE=1 BENCH_BACKENDS="mlx ollama" bash tests/bench-commit-message-body.sh
+BENCH="$SKILL_DIR/tests/bench-commit-message-body.sh"
+CM_FIX="$SKILL_DIR/tests/fixtures/commit-message"
+
+if bash -n "$BENCH" 2>/dev/null; then
+  echo "  PASS  bench script is syntactically valid"
+  pass=$((pass+1))
+else
+  echo "  FAIL  bench script has a syntax error"
+  fail=$((fail+1))
+fi
+
+# Shared anchors + >=6 thin diffs + a rich control, each with a paired .why.
+diff_count=0
+for d in "$CM_FIX"/*.diff; do [[ -f "$d" ]] && diff_count=$((diff_count+1)); done
+if [[ -f "$CM_FIX/recent_commits.txt" && "$diff_count" -ge 7 ]]; then
+  echo "  PASS  bench fixtures present ($diff_count diffs + recent_commits.txt)"
+  pass=$((pass+1))
+else
+  echo "  FAIL  bench fixtures missing (found $diff_count diffs, want >=7 + recent_commits.txt)"
+  fail=$((fail+1))
+fi
+
+missing_why=0
+for d in "$CM_FIX"/*.diff; do [[ -f "${d%.diff}.why" ]] || missing_why=$((missing_why+1)); done
+assert_eq "0" "$missing_why" "every bench .diff has a paired .why"
+
+# The bench's own score_body, eval'd from its one-line definition.
+eval "$(grep -E '^score_body\(\) ' "$BENCH")"
+if score_body "$(printf 'subject line\n\nbody paragraph')"; then
+  echo "  PASS  score_body accepts a subject+body (>=2 non-empty lines)"
+  pass=$((pass+1))
+else
+  echo "  FAIL  score_body rejected a valid subject+body"
+  fail=$((fail+1))
+fi
+if score_body "only-a-subject"; then
+  echo "  FAIL  score_body accepted a subject-only message"
+  fail=$((fail+1))
+else
+  echo "  PASS  score_body rejects a subject-only message (the body-drop shape)"
+  pass=$((pass+1))
+fi
+
+echo
+echo "=== doc-section padding bench (wiring smoke — no model contact) ==="
+
+# Offline: never runs the bench. The live gate is opt-in:
+#   BENCH_GATE=1 BENCH_BACKENDS="mlx ollama" bash tests/bench-doc-section-padding.sh
+DSBENCH="$SKILL_DIR/tests/bench-doc-section-padding.sh"
+DS_FIX="$SKILL_DIR/tests/fixtures/doc-section"
+
+if bash -n "$DSBENCH" 2>/dev/null; then
+  echo "  PASS  doc-section bench is syntactically valid"
+  pass=$((pass+1))
+else
+  echo "  FAIL  doc-section bench has a syntax error"
+  fail=$((fail+1))
+fi
+
+ds_count=0
+for f in "$DS_FIX"/*.txt; do [[ -f "$f" ]] && ds_count=$((ds_count+1)); done
+if [[ "$ds_count" -ge 6 ]]; then
+  echo "  PASS  doc-section fixtures present ($ds_count topic files)"
+  pass=$((pass+1))
+else
+  echo "  FAIL  doc-section fixtures missing (found $ds_count, want >=6)"
+  fail=$((fail+1))
+fi
+
+# The bench's own scorers, with padding_re from lib/checks.sh as the bench reads
+# it; a failed extraction fails cleanly rather than on an undefined function.
+eval "$(grep -E '^[[:space:]]*padding_re=' "$SKILL_DIR/scripts/lib/checks.sh" | head -1)"
+eval "$(grep -E '^has_padding\(\) ' "$DSBENCH")"
+eval "$(grep -E '^count_sentences\(\) ' "$DSBENCH")"
+if [[ -n "${padding_re:-}" ]] && command -v has_padding >/dev/null 2>&1 && command -v count_sentences >/dev/null 2>&1; then
+  ds_recap="One sentence of guidance. Consequently, this is strictly opt-in and should be avoided."
+  ds_clean="One sentence of guidance. The four knobs are enforced via CI env vars that override the TOML."
+  if has_padding "$ds_recap"; then
+    echo "  PASS  has_padding flags a closing-recap sentence"
+    pass=$((pass+1))
+  else
+    echo "  FAIL  has_padding missed a closing-recap sentence"
+    fail=$((fail+1))
+  fi
+  if has_padding "$ds_clean"; then
+    echo "  FAIL  has_padding false-positived a clean paragraph"
+    fail=$((fail+1))
+  else
+    echo "  PASS  has_padding passes a clean paragraph"
+    pass=$((pass+1))
+  fi
+  assert_eq "3" "$(count_sentences 'a. b! c?')" "count_sentences counts terminal punctuation"
+else
+  echo "  FAIL  could not extract padding_re / has_padding / count_sentences (bench drifted?)"
+  fail=$((fail+1))
+fi
+
+echo "=== pick-model.sh: DELEGATE_BASE_URL provider list ==="
+
+# The first reachable provider holding a tier match wins.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "8080:mlx-community/Qwen3.6-35B-A3B-8bit 11434:qwen3.6-ollama"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:8080/v1 http://localhost:11434/v1" \
+  bash "$PICK" prose 2>/dev/null)
+assert_eq "mlx-community/Qwen3.6-35B-A3B-8bit" "$got" "provider list: first provider wins"
+rm -rf "$tmp"
+
+# An unreachable first provider is skipped, not fatal (a bare assignment
+# under set -e would abort here).
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "11434:qwen3.6-ollama"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:9/v1 http://localhost:11434/v1" \
+  bash "$PICK" prose 2>/dev/null)
+assert_eq "qwen3.6-ollama" "$got" "provider list: falls through an unreachable provider"
+rm -rf "$tmp"
+
+# Reachable but holding no model for this tier is also a skip.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "8080:nomic-embed-text 11434:qwen3.6-ollama"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:8080/v1 http://localhost:11434/v1" \
+  bash "$PICK" prose 2>/dev/null)
+assert_eq "qwen3.6-ollama" "$got" "provider list: falls through a provider with no tier match"
+rm -rf "$tmp"
+
+# Every provider unreachable -> exit 1.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" ""
+EC=0
+env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:9/v1 http://localhost:8/v1" \
+  bash "$PICK" prose >/dev/null 2>&1 || EC=$?
+assert_eq "1" "$EC" "provider list: all providers unreachable exits 1"
+rm -rf "$tmp"
+
+# The dry-run trace names the provider it skipped.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "11434:qwen3.6-ollama"
+trace=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:9/v1 http://localhost:11434/v1" \
+  bash "$PICK" --dry-run prose 2>&1)
+assert_contains "localhost:9" "$trace" "provider list: trace names the skipped provider"
+rm -rf "$tmp"
+
+# Reported ids are sorted, since daemon ordering is recency-based.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "8080:qwen3.6-b,qwen3.6-a"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:8080/v1" \
+  bash "$PICK" prose 2>/dev/null)
+assert_eq "qwen3.6-a" "$got" "provider list: sorted ids make two matches deterministic"
+rm -rf "$tmp"
+
+# --print-resolution returns base and model in one probe.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "8080:mlx-community/Qwen3.6-35B-A3B-8bit"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:8080/v1" \
+  bash "$PICK" --print-resolution prose 2>/dev/null)
+assert_eq "http://localhost:8080/v1	mlx-community/Qwen3.6-35B-A3B-8bit" "$got" \
+  "provider list: --print-resolution returns base and model"
+rm -rf "$tmp"
+
+# One trailing slash is stripped so the base never doubles up.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "8080:mlx-community/Qwen3.6-35B-A3B-8bit"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:8080/v1/" \
+  bash "$PICK" --print-resolution prose 2>/dev/null)
+assert_eq "http://localhost:8080/v1	mlx-community/Qwen3.6-35B-A3B-8bit" "$got" \
+  "provider list: one trailing slash is stripped"
+rm -rf "$tmp"
+
+# A userinfo URL is rejected before any request leaves the process.
+tmp=$(mktemp -d)
+cat > "$tmp/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "MOCK CURL WAS CALLED" >&2
+exit 0
+EOF
+chmod +x "$tmp/curl"
+EC=0
+err=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://user:pass@localhost:8080/v1" \
+  bash "$PICK" prose 2>&1) || EC=$?
+assert_eq "2" "$EC" "provider list: userinfo URL exits 2"
+case "$err" in
+  *"MOCK CURL WAS CALLED"*) assert_eq "no request" "a request was made" "provider list: userinfo rejected before any request" ;;
+  *) assert_eq "no request" "no request" "provider list: userinfo rejected before any request" ;;
+esac
+rm -rf "$tmp"
+
+# --print-installed reports what the providers serve, not an HF cache scan.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "8080:mlx-a,mlx-b 11434:ollama-a"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:8080/v1 http://localhost:11434/v1" \
+  bash "$PICK" --print-installed 2>/dev/null | tr '\n' ' ')
+assert_eq "mlx-a mlx-b ollama-a " "$got" "provider list: --print-installed unions the providers"
+rm -rf "$tmp"
+
+# An unreachable provider is skipped by --print-installed too.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "11434:ollama-a"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  DELEGATE_BASE_URL="http://localhost:9/v1 http://localhost:11434/v1" \
+  bash "$PICK" --print-installed 2>/dev/null | tr '\n' ' ')
+assert_eq "ollama-a " "$got" "provider list: --print-installed skips an unreachable provider"
+rm -rf "$tmp"
+
+# --print-resolution answers from the default list with no explicit one set.
+tmp=$(mktemp -d)
+make_mock_provider "$tmp" "11434:qwen3.6-ollama"
+got=$(env -i PATH="$tmp:$SAFE_PATH" HOME="$tmp" \
+  bash "$PICK" --print-resolution prose 2>/dev/null)
+assert_eq "http://localhost:11434/v1	qwen3.6-ollama" "$got" \
+  "provider list: --print-resolution answers from the default list"
+rm -rf "$tmp"
+
+# No native /api/generate arm or DELEGATE_BACKEND comes back: a reintroduced
+# arm is invisible to behavioural tests. The file list is explicit because
+# eval-skill-triggers.sh still posts to /api/generate legitimately.
+leftovers=$(grep -l 'api/generate\|DELEGATE_BACKEND' \
+  "$SKILL_DIR/scripts/delegate.sh" "$SKILL_DIR/scripts/pick-model.sh" \
+  "$SKILL_DIR/scripts/embed.sh" "$SKILL_DIR/scripts/audit-models.sh" 2>/dev/null || true)
+assert_eq "" "$leftovers" "dispatch path: no /api/generate arm and no DELEGATE_BACKEND left"
+
+echo
+echo "=== Results ==="
+total=$((pass+fail))
+echo "$pass/$total passed"
+[[ "$fail" -eq 0 ]]
